@@ -82,22 +82,30 @@ class HttpResponse {
 public:
     HttpResponse(int statusCode, std::string statusText)
         : statusCode_(statusCode), statusText_(std::move(statusText)) {
-        headers_["Connection"] = "close";
         headers_["Server"] = "MyHttpCppServer/1.0";
     }
 
-    void set_header(std::string key, std::string value) {
+    void setKeepAlive(bool keepAlive) {
+        if (keepAlive) {
+            headers_["Connection"] = "keep-alive";
+            headers_["Keep-Alive"] = "timeout=5, max=100";
+        } else {
+            headers_["Connection"] = "close";
+        }
+    }
+
+    void setHeader(std::string key, std::string value) {
         headers_[std::move(key)] = std::move(value);
     }
 
-    void set_body(std::vector<char> body, const std::string& content_type) {
+    void setBody(std::vector<char> body, const std::string& content_type) {
         body_ = std::move(body);
-        set_header("Content-Type", content_type);
-        set_header("Content-Length", std::to_string(body_.size()));
+        setHeader("Content-Type", content_type);
+        setHeader("Content-Length", std::to_string(body_.size()));
     }
 
-    void set_body(const std::string& text_body, const std::string& content_type) {
-        set_body(std::vector<char>(text_body.begin(), text_body.end()), content_type);
+    void setBody(const std::string& text_body, const std::string& content_type) {
+        setBody(std::vector<char>(text_body.begin(), text_body.end()), content_type);
     }
 
     std::vector<char> serialize() const {
@@ -113,11 +121,12 @@ public:
         return wireData;
     }
 
-    static HttpResponse makeError(int code, const std::string& title, const std::string& content) {
+    static HttpResponse makeError(int code, const std::string& title, const std::string& content, bool keepAlive = false) {
         HttpResponse res(code, title);
+        res.setKeepAlive(keepAlive);
         std::string body = "<html><body><h1>" + std::to_string(code) + " " + title + 
                            "</h1><p>" + content + "</p></body></html>";
-        res.set_body(body, "text/html");
+        res.setBody(body, "text/html");
         return res;
     }
 };
@@ -176,7 +185,7 @@ public:
         }
 
         HttpResponse res(200, "OK");
-        res.set_body(std::move(file_data), getMimeType(requestedPath));
+        res.setBody(std::move(file_data), getMimeType(requestedPath));
         return res;
     }
 };
@@ -201,18 +210,49 @@ class TcpServer {
     }
 
     void handleClient(UniqueFd clientFd) {
-        char buffer[4096];
-        ssize_t bytesRead = read(clientFd.get(), buffer, sizeof(buffer)-1);
-        if(bytesRead <= 0) {
-            return;
+        int requestCount = 0;
+        const int maxRequestsPerConnection = 100;
+        struct timeval tv{};
+        tv.tv_sec = 5;
+        tv.tv_usec = 0;
+        setsockopt(clientFd.get(), SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        while(requestCount < maxRequestsPerConnection) {
+            char buffer[4096];
+            ssize_t bytesRead = read(clientFd.get(), buffer, sizeof(buffer)-1);
+            if(bytesRead <= 0) {
+                return;
+            }
+
+            buffer[bytesRead] = '\0';
+
+            auto req = HttpRequest::parse(buffer);
+            if (!req) {
+                HttpResponse res = HttpResponse::makeError(400, "Bad Request", "Malformed HTTP request.", false);
+                std::vector<char> wireData = res.serialize();
+                sendAll(clientFd.get(), wireData.data(), wireData.size());
+                break;
+            }
+            requestCount++;
+            bool clientWantsClose = false;
+            auto connectionHeader = req->headers.find("Connection");
+            if (connectionHeader != req->headers.end()) {
+                std::string val = connectionHeader->second;
+                if (val.find("close") != std::string::npos || val.find("Close") != std::string::npos) {
+                    clientWantsClose = true;
+                }
+            }   
+            bool keepAlive = !clientWantsClose && (requestCount < maxRequestsPerConnection);
+            HttpResponse res = handler_.handle(*req);
+            res.setKeepAlive(keepAlive);
+            std::vector<char> wireData = res.serialize();
+            if (!sendAll(clientFd.get(), wireData.data(), wireData.size())) {
+                break;
+            }
+
+            if (!keepAlive) {
+                break;
+            }
         }
-
-        buffer[bytesRead] = '\0';
-
-        auto req = HttpRequest::parse(buffer);
-        HttpResponse res = req ? handler_.handle(*req) : HttpResponse::makeError(400, "Bad Request", "Malforned HTTP request.");
-        std::vector<char> wireData = res.serialize();
-        sendAll(clientFd.get(), wireData.data(), wireData.size());
     }
 
 public:
